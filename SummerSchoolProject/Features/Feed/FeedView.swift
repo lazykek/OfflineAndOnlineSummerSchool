@@ -23,8 +23,8 @@ struct FeedView: View {
             LoadingView()
         case .loaded(let posts):
             List {
-                if viewModel.isOffline {
-                    OfflineBadge()
+                if viewModel.dataSource != .network {
+                    CacheBadge(dataSource: viewModel.dataSource)
                         .listRowInsets(EdgeInsets())
                         .listRowSeparator(.hidden)
                 }

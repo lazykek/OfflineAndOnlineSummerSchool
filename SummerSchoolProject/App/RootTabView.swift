@@ -16,6 +16,9 @@ struct RootTabView: View {
 
             BalanceView()
                 .tabItem { Label("Баланс", systemImage: "wallet.pass") }
+
+            SettingsView()
+                .tabItem { Label("Настройки", systemImage: "gearshape") }
         }
     }
 }

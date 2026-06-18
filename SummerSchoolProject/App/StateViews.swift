@@ -32,11 +32,52 @@ struct ErrorStateView: View {
     }
 }
 
+// MARK: - Cache badges
+
+struct CacheBadge: View {
+    let dataSource: DataSource
+
+    var body: some View {
+        switch dataSource {
+        case .network:
+            EmptyView()
+        case .staleCache(let age):
+            StaleBadge(age: age)
+        case .offlineCache:
+            OfflineBadge()
+        }
+    }
+}
+
+struct StaleBadge: View {
+    let age: TimeInterval
+
+    private var ageText: String {
+        if age == .infinity { return "" }
+        let mins = Int(age) / 60
+        let secs = Int(age) % 60
+        if mins > 0 { return " · \(mins) мин \(secs) с назад" }
+        return " · \(secs) с назад"
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+            Text("Данные могли устареть · обновляем…\(ageText)")
+        }
+        .font(.footnote)
+        .foregroundStyle(.orange)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+
 struct OfflineBadge: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "wifi.slash")
-            Text("Оффлайн — показаны сохранённые данные")
+            Text("Оффлайн — сохранённые данные")
         }
         .font(.footnote)
         .foregroundStyle(.secondary)

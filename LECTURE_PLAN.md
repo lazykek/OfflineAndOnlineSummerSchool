@@ -373,3 +373,85 @@ final class ImageLoader {
 
 ### Резюме
 `URLCache` — «бесплатный» HTTP-кэш на уровне сессии: подключаете `urlCache`, и `URLSession` кэширует GET-ответы по заголовкам сервера. Поведением управляете через `requestCachePolicy`, а в offline вручную достаёте сохранённый ответ. Минусы — зависимость от заголовков, нюанс с редиректами и нестабильность дискового хранилища, поэтому для серьёзного offline дальше вводятся свой TTL, отдельный источник правды и outbox.
+
+---
+
+## Приложение B. Инвалидация кэша (углублённо к блоку 1.3)
+
+**Самое главное в коммите 3 — управление актуальностью кэша, а не сам кэш.** Коммит 2 научил приложение *показывать* сохранённые данные офлайн. Коммит 3 отвечает на более сложный вопрос: **как не показать протухшее и не утечь чужие данные.** Это место, где чаще всего ошибаются — «положить в кэш» легко, «вовремя выкинуть» сложно.
+
+В `CacheManager` появляется единая точка управления жизненным циклом кэша. Три механизма:
+
+### 1. TTL (time-to-live)
+У каждой записи есть «возраст»; данные старше порога (`cacheTTL`) считаются устаревшими.
+- Реализован паттерн **stale-while-revalidate**: показать кэш сразу, а в фоне пойти за свежим.
+- UI честно сообщает источник через `enum DataSource { network / staleCache / offlineCache }` и бейджи (`CacheBadge` / `StaleBadge` / `OfflineBadge`).
+- Срок жизни определяет **приложение**, а не сервер — в отличие от `URLCache` (Приложение A), который зависит только от HTTP-заголовков.
+
+```swift
+enum DataSource: Equatable {
+    case network
+    case staleCache(age: TimeInterval)
+    case offlineCache
+}
+
+// после успешного ответа из сети — запоминаем момент получения
+func saveTimestamp(for key: String) {
+    var timestamps = storedTimestamps()
+    timestamps[key] = Date()
+    if let data = try? JSONEncoder().encode(timestamps) {
+        UserDefaults.standard.set(data, forKey: timestampKey)
+    }
+}
+
+// возраст записи + наличие сети → откуда показываем данные
+func dataSource(for key: String, isNetworkAvailable: Bool) -> DataSource {
+    guard let savedAt = storedTimestamps()[key] else {
+        return isNetworkAvailable ? .staleCache(age: .infinity) : .offlineCache
+    }
+    let age = Date().timeIntervalSince(savedAt)
+    if !isNetworkAvailable { return .offlineCache }
+    if age <= CacheManager.cacheTTL { return .offlineCache }
+    return .staleCache(age: age)
+}
+```
+
+### 2. Версионирование схемы
+Константа `cacheSchemaVersion`: при смене версии модели данных весь старый кэш сбрасывается на старте приложения.
+- Защита от «показали данные в формате, который мы больше не поддерживаем».
+- На демо: достаточно изменить константу и перезапустить — кэш снесён.
+
+### 3. Очистка при логауте — главный акцент
+🔑 **Это безопасность, а не просто гигиена кэша.** Классическая утечка:
+- пользователь A залогинился → лента/данные закэшировались;
+- A вышел из аккаунта;
+- зашёл пользователь B → **видит данные A из кэша**.
+
+`CacheManager.clearAll()`, вызываемый из `SessionStore.logout()`, за один вызов чистит **все слои**: `URLCache` (HTTP-ответы), TTL-метаданные и кэш картинок (память + диск) через `ImageLoader.clearCache()`.
+- Ключевая идея — **единая точка очистки**: невозможно забыть один из слоёв.
+
+```swift
+// CacheManager — единая точка очистки всех слоёв кэша
+func clearAll() {
+    urlCache.removeAllCachedResponses()                 // HTTP-ответы
+    UserDefaults.standard.removeObject(forKey: timestampKey)  // TTL-метаданные
+    ImageLoader.shared.clearCache()                     // картинки: RAM + диск
+}
+
+// SessionStore.logout() — дёргает единую точку
+func logout() {
+    currentUser = nil
+    UserDefaults.standard.removeObject(forKey: userDefaultsKey)
+    CacheManager.shared.clearAll()                      // ← чужие данные не утекут
+    TicketRepository.shared.clearLocal()
+}
+```
+
+### Почему это «ядро» лекции
+Инвалидация кэша помечена как то, что **нельзя резать ни при каких условиях** (см. «План Б»). Причина: здесь возникают и баги (протухшие данные), и уязвимости (чужие данные после логаута).
+
+### Одна фраза для слайда
+> «Кэш без стратегии инвалидации — это не оптимизация, а отложенный баг или утечка. Самое важное — очистка при логауте через единую точку: вышел пользователь A — пользователь B не должен увидеть ничего из его данных.»
+
+### Мостик к блоку 2
+TTL / версия / логаут управляют **кэшем** (производные данные). Но для критичных пользовательских данных (билет) кэша недостаточно — там нужен полноценный источник правды (блок 2.1, коммит 4).

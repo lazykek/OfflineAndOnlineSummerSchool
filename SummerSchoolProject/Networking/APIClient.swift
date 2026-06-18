@@ -5,21 +5,30 @@
 
 import Foundation
 
+// MARK: - Endpoints
+
 enum Endpoint {
     static let baseURL = URL(string: "https://jsonplaceholder.typicode.com")!
 
     case posts
     case user(id: Int)
 
-    var url: URL {
+    nonisolated var url: URL {
         switch self {
-            case .posts:
-                return Endpoint.baseURL.appendingPathComponent("posts")
-            case .user(let id):
-                return Endpoint.baseURL.appendingPathComponent("users/\(id)")
+        case .posts: return Endpoint.baseURL.appendingPathComponent("posts")
+        case .user(let id): return Endpoint.baseURL.appendingPathComponent("users/\(id)")
+        }
+    }
+
+    nonisolated var cacheKey: String {
+        switch self {
+        case .posts: return "endpoint.posts"
+        case .user(let id): return "endpoint.user.\(id)"
         }
     }
 }
+
+// MARK: - Errors
 
 enum APIError: LocalizedError {
     case invalidResponse
@@ -29,88 +38,101 @@ enum APIError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-            case .invalidResponse:
-                "Некорректный ответ сервера."
-            case .statusCode(let code):
-                "Сервер вернул ошибку (код \(code))."
-            case .decoding:
-                "Не удалось обработать данные."
-            case .transport:
-                "Не удалось загрузить. Проверьте соединение."
+        case .invalidResponse: return "Некорректный ответ сервера."
+        case .statusCode(let c): return "Сервер вернул ошибку (код \(c))."
+        case .decoding: return "Не удалось обработать данные."
+        case .transport: return "Не удалось загрузить. Проверьте соединение."
         }
     }
 }
 
+// MARK: - Fetched<Value>
+
 struct Fetched<Value> {
     let value: Value
-    let isFromCache: Bool
+    let dataSource: DataSource
+
+    var isFromCache: Bool { dataSource != .network }
 }
+
+// MARK: - APIClient
 
 nonisolated struct APIClient {
     static let requestTimeout: TimeInterval = 5
 
     static let shared = APIClient()
 
-    private let session: URLSession
     private let cache: URLCache
+    private let session: URLSession
     private let decoder: JSONDecoder
+    private let cacheManager: CacheManager
 
     init() {
-        let cache = URLCache(
-            memoryCapacity: 16 * 1024 * 1024,
-            diskCapacity: 128 * 1024 * 1024,
-            diskPath: "api-cache"
-        )
+        cacheManager = CacheManager.shared
+        cache = cacheManager.urlCache
 
         let config = URLSessionConfiguration.default
         config.urlCache = cache
         config.requestCachePolicy = .useProtocolCachePolicy
-        config.timeoutIntervalForRequest  = APIClient.requestTimeout
+        config.timeoutIntervalForRequest = APIClient.requestTimeout
         config.timeoutIntervalForResource = APIClient.requestTimeout
 
-        self.cache = cache
-        self.session = URLSession(configuration: config)
-        self.decoder = JSONDecoder()
+        session = URLSession(configuration: config)
+        decoder = JSONDecoder()
+    }
+
+    // MARK: - Public API
+
+    func getCachedIfAvailable<T: Decodable>(_ endpoint: Endpoint) -> Fetched<T>? {
+        let request = URLRequest(url: endpoint.url)
+        guard
+            let cached = cache.cachedResponse(for: request),
+            let value = try? decode(cached.data) as T
+        else { return nil }
+
+        let source = cacheManager.dataSource(
+            for: endpoint.cacheKey,
+            isNetworkAvailable: true
+        )
+        return Fetched(value: value, dataSource: source)
     }
 
     func get<T: Decodable>(_ endpoint: Endpoint) async throws -> Fetched<T> {
         let request = URLRequest(url: endpoint.url)
 
-        let data: Data
-        let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            let (rawData, response) = try await session.data(for: request)
+            try validate(response)
+            cacheManager.saveTimestamp(for: endpoint.cacheKey)
+            return Fetched(value: try decode(rawData), dataSource: .network)
         } catch is CancellationError {
             throw CancellationError()
         } catch let urlError as URLError where urlError.code == .cancelled {
             throw CancellationError()
+        } catch let error as APIError {
+            throw error
         } catch {
-            if let cached = cache.cachedResponse(for: request) {
-                return Fetched(value: try decode(cached.data), isFromCache: true)
+            if let cached = cache.cachedResponse(for: request),
+               let value = try? decode(cached.data) as T {
+                let source = cacheManager.dataSource(
+                    for: endpoint.cacheKey,
+                    isNetworkAvailable: false
+                )
+                return Fetched(value: value, dataSource: source)
             }
             throw APIError.transport(error)
         }
-
-        try validate(response)
-        return Fetched(value: try decode(data), isFromCache: false)
     }
 
     // MARK: - Helpers
 
     private func validate(_ response: URLResponse) throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw APIError.invalidResponse
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            throw APIError.statusCode(http.statusCode)
-        }
+        guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else { throw APIError.statusCode(http.statusCode) }
     }
 
     private func decode<T: Decodable>(_ data: Data) throws -> T {
-        do {
-            return try decoder.decode(T.self, from: data)
-        } catch {
-            throw APIError.decoding(error)
-        }
+        do { return try decoder.decode(T.self, from: data) }
+        catch { throw APIError.decoding(error) }
     }
 }

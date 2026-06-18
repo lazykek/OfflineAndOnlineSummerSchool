@@ -9,6 +9,7 @@ import Foundation
 @MainActor
 final class BalanceViewModel: ObservableObject {
     @Published var state: LoadState<Balance> = .idle
+    @Published var dataSource: DataSource = .network
 
     private let client: APIClient
 
@@ -17,12 +18,22 @@ final class BalanceViewModel: ObservableObject {
     }
 
     func load() async {
-        state = .loading
+        if case .idle = state {
+            if let cached: Fetched<RemoteUser> = client.getCachedIfAvailable(.user(id: 1)) {
+                dataSource = cached.dataSource
+                state = .loaded(Balance(user: cached.value))
+            } else {
+                state = .loading
+            }
+        }
+
         do {
             let result: Fetched<RemoteUser> = try await client.get(.user(id: 1))
+            dataSource = result.dataSource
             state = .loaded(Balance(user: result.value))
         } catch {
-            state = .failed(error)
+            if case .loaded = state { /* keep cached data */ }
+            else { state = .failed(error) }
         }
     }
 }

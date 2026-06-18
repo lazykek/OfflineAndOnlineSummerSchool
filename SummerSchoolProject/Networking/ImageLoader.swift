@@ -4,49 +4,79 @@
 //
 
 import UIKit
+import CryptoKit
 
 final class ImageLoader {
     static let shared = ImageLoader()
 
+    // MARK: - Level 1: memory
+
     private let memory = NSCache<NSURL, UIImage>()
-    private let session: URLSession
+
+    // MARK: - Level 2: disk
+
+    let diskCacheURL: URL
+
+    // MARK: - Level 3: network
+
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = nil
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }()
 
     private init() {
-        let cache = URLCache(
-            memoryCapacity: 8 * 1024 * 1024,
-            diskCapacity: 256 * 1024 * 1024,
-            diskPath: "image-cache"
-        )
-        let config = URLSessionConfiguration.default
-        config.urlCache = cache
-        config.requestCachePolicy = .useProtocolCachePolicy
-        self.session = URLSession(configuration: config)
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        diskCacheURL = caches.appendingPathComponent("image-disk-cache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: diskCacheURL,
+                                                 withIntermediateDirectories: true)
     }
+
+    // MARK: - Public API
 
     func image(for url: URL) async throws -> UIImage {
         if let cached = memory.object(forKey: url as NSURL) {
             return cached
         }
-
-        let request = URLRequest(url: url)
-        do {
-            let (data, _) = try await session.data(for: request)
-            return try store(data, for: url)
-        } catch {
-            if let cached = session.configuration.urlCache?.cachedResponse(for: request),
-               let image = UIImage(data: cached.data) {
-                memory.setObject(image, forKey: url as NSURL)
-                return image
-            }
-            throw error
+        if let image = loadFromDisk(for: url) {
+            memory.setObject(image, forKey: url as NSURL)
+            return image
         }
-    }
-
-    private func store(_ data: Data, for url: URL) throws -> UIImage {
+        let (data, _) = try await session.data(from: url)
         guard let image = UIImage(data: data) else {
             throw URLError(.cannotDecodeContentData)
         }
+        saveToDisk(data, for: url)
         memory.setObject(image, forKey: url as NSURL)
         return image
+    }
+
+    // MARK: - Cache clearance
+
+    func clearCache() {
+        memory.removeAllObjects()
+        try? FileManager.default.removeItem(at: diskCacheURL)
+        try? FileManager.default.createDirectory(at: diskCacheURL,
+                                                 withIntermediateDirectories: true)
+    }
+
+    // MARK: - Disk helpers
+
+    private func diskFileURL(for url: URL) -> URL {
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return diskCacheURL.appendingPathComponent(hex)
+    }
+
+    private func loadFromDisk(for url: URL) -> UIImage? {
+        let file = diskFileURL(for: url)
+        guard let data = try? Data(contentsOf: file) else { return nil }
+        return UIImage(data: data)
+    }
+
+    private func saveToDisk(_ data: Data, for url: URL) {
+        let file = diskFileURL(for: url)
+        try? data.write(to: file, options: .atomic)
     }
 }

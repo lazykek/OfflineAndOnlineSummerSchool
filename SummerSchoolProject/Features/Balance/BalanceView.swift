@@ -22,7 +22,10 @@ struct BalanceView: View {
         case .idle, .loading:
             LoadingView()
         case .loaded(let balance):
-            balanceCard(balance)
+            VStack(spacing: 0) {
+                CacheBadge(dataSource: viewModel.dataSource)
+                balanceCard(balance)
+            }
         case .failed(let error):
             ErrorStateView(error: error) {
                 Task { await viewModel.load() }
@@ -55,11 +58,9 @@ struct BalanceView: View {
 
     private func row(_ title: String, _ value: String) -> some View {
         HStack {
-            Text(title)
-                .foregroundStyle(.secondary)
+            Text(title).foregroundStyle(.secondary)
             Spacer()
-            Text(value)
-                .fontWeight(.medium)
+            Text(value).fontWeight(.medium)
         }
     }
 }

@@ -22,7 +22,10 @@ struct TicketView: View {
         case .idle, .loading:
             LoadingView()
         case .loaded(let ticket):
-            ticketCard(ticket)
+            VStack(spacing: 0) {
+                CacheBadge(dataSource: viewModel.dataSource)
+                ticketCard(ticket)
+            }
         case .failed(let error):
             ErrorStateView(error: error) {
                 Task { await viewModel.load() }
@@ -54,6 +57,7 @@ struct TicketView: View {
             }
         }
         .padding()
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private func info(_ title: String, _ value: String) -> some View {
