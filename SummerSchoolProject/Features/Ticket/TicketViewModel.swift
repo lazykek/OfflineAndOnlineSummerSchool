@@ -6,34 +6,45 @@
 import Combine
 import Foundation
 
+// MARK: - TicketSyncStatus
+
+enum TicketSyncStatus: Equatable {
+    case synced(at: Date)
+    case offline
+    case syncing
+}
+
+// MARK: - TicketViewModel
+
 @MainActor
 final class TicketViewModel: ObservableObject {
     @Published var state: LoadState<Ticket> = .idle
-    @Published var dataSource: DataSource = .network
+    @Published var syncStatus: TicketSyncStatus = .syncing
 
-    private let client: APIClient
+    private let repository: TicketRepository
 
-    init(client: APIClient = .shared) {
-        self.client = client
+    init(repository: TicketRepository? = nil) {
+        self.repository = repository ?? .shared
     }
 
     func load() async {
-        if case .idle = state {
-            if let cached: Fetched<RemoteUser> = client.getCachedIfAvailable(.user(id: 1)) {
-                dataSource = cached.dataSource
-                state = .loaded(Ticket(user: cached.value))
-            } else {
-                state = .loading
-            }
+        if let local = repository.loadLocal() {
+            state = .loaded(local)
+            syncStatus = .syncing
+        } else {
+            state = .loading
         }
 
         do {
-            let result: Fetched<RemoteUser> = try await client.get(.user(id: 1))
-            dataSource = result.dataSource
-            state = .loaded(Ticket(user: result.value))
+            let fresh = try await repository.refreshFromNetwork()
+            state = .loaded(fresh)
+            syncStatus = .synced(at: repository.lastSyncedAt ?? Date())
         } catch {
-            if case .loaded = state { /* keep cached data */ }
-            else { state = .failed(error) }
+            if case .loaded = state {
+                syncStatus = .offline
+            } else {
+                state = .failed(error)
+            }
         }
     }
 }

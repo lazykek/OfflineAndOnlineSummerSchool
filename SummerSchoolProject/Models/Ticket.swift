@@ -5,7 +5,9 @@
 
 import Foundation
 
-struct Ticket {
+// MARK: - Ticket
+
+struct Ticket: Codable {
     let passengerName: String
     let flightNumber: String
     let seat: String

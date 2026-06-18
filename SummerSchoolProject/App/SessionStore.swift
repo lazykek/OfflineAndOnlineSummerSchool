@@ -29,5 +29,6 @@ final class SessionStore: ObservableObject {
         currentUser = nil
         UserDefaults.standard.removeObject(forKey: userDefaultsKey)
         CacheManager.shared.clearAll()
+        TicketRepository.shared.clearLocal()
     }
 }

@@ -455,3 +455,125 @@ func logout() {
 
 ### Мостик к блоку 2
 TTL / версия / логаут управляют **кэшем** (производные данные). Но для критичных пользовательских данных (билет) кэша недостаточно — там нужен полноценный источник правды (блок 2.1, коммит 4).
+
+---
+
+## Приложение C. LocalStore как источник правды (углублённо к блоку 2.1)
+
+**Основная идея коммита 4 — смена парадигмы: локальное хранилище становится источником правды, а сеть лишь синхронизирует его.** Это качественный скачок относительно кэша (коммиты 2–3).
+
+### Кэш vs источник правды
+
+| | Кэш (коммиты 2–3) | LocalStore (коммит 4) |
+|---|---|---|
+| Роль | фолбэк «если сеть упала» | первоисточник, читается всегда |
+| Природа данных | производные (можно потерять) | данные пользователя |
+| Папка | `Library/Caches` (ОС может удалить) | `Library/Application Support` (ОС не трогает, бэкапится) |
+| Поток | сеть → показать, кэш только при ошибке | диск → показать сразу, сеть обновляет в фоне |
+
+🔑 Для билета фолбэк-кэш недопустим: систему может вычистить `Caches` под нехватку места → пассажир останется без QR на стойке. Поэтому билет хранится как источник правды.
+
+### Папки песочницы iOS
+| Папка | Назначение | ОС удаляет? | В бэкапе? |
+|---|---|---|---|
+| `Documents/` | пользовательские файлы, видны в Finder | нет | да |
+| `Library/Application Support/` | **данные приложения (мы здесь)** | нет | да |
+| `Library/Caches/` | URLCache, картинки | да (под нехватку места) | нет |
+| `tmp/` | временные файлы | да (произвольно) | нет |
+
+### Ключевой код: generic-хранилище в Application Support
+```swift
+final class LocalStore: @unchecked Sendable {
+    static let shared = LocalStore()
+    private let baseURL: URL
+
+    private init() {
+        let appSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first!
+        let bundleID = Bundle.main.bundleIdentifier ?? "app"
+        baseURL = appSupport.appendingPathComponent(bundleID, isDirectory: true)
+        try? FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
+    }
+
+    func save<T: Encodable>(_ value: T, forKey key: String) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        try? data.write(to: fileURL(key), options: .atomic)
+    }
+
+    func load<T: Decodable>(forKey key: String) -> T? {
+        guard let data = try? Data(contentsOf: fileURL(key)) else { return nil }
+        return try? JSONDecoder().decode(T.self, from: data)
+    }
+
+    private func fileURL(_ key: String) -> URL {
+        baseURL.appendingPathComponent("\(key).json")
+    }
+}
+```
+
+### Ключевой код: local-first репозиторий билета
+```swift
+final class TicketRepository {
+    // 1) мгновенно с диска — работает в авиарежиме, 0 мс
+    func loadLocal() -> Ticket? { store.load(forKey: ticketKey) }
+
+    // 2) в фоне обновляем ИСТОЧНИК ПРАВДЫ, не блокируя UI
+    func refreshFromNetwork() async throws -> Ticket {
+        let result: Fetched<RemoteUser> = try await client.get(.user(id: 1))
+        let ticket = Ticket(user: result.value)
+        store.save(ticket, forKey: ticketKey)
+        store.save(Date(), forKey: syncedAtKey)
+        return ticket
+    }
+
+    // 3) при логауте — персональные данные не остаются на устройстве
+    func clearLocal() {
+        store.remove(forKey: ticketKey)
+        store.remove(forKey: syncedAtKey)
+    }
+}
+```
+Поток на экране: `loadLocal → показать (QR из локального payload) → refreshFromNetwork → тихо обновить`. Экран ошибки возможен только при самом первом запуске без сети, когда локальной копии ещё нет.
+
+### Как было ДО этого коммита (1–3)
+Билет грузился так же, как лента и баланс — **прямо из сети** через `APIClient.get(.user(id: 1))`, и жил только в памяти ViewModel (`state: LoadState<Ticket>`). Диска не было.
+- **Коммит 1 (online-only):** нет сети → `.failed` → экран ошибки `wifi.slash`. QR **не строится** — данные не пришли. Пассажир офлайн остаётся без билета.
+- **Коммиты 2–3 (кэш):** билет «случайно» выигрывал от общего `URLCache` — если ответ `/users/1` лежал в кэше, он мог подхватиться. Но это **кэш**, а не источник правды: лежит в `Library/Caches` (ОС может вычистить), зависит от заголовков и наличия записи. Билет офлайн **мог** показаться, но полагаться на это нельзя.
+
+### Что изменилось в `TicketViewModel`
+```swift
+// СТАЛО (коммит 4): local-first
+func load() async {
+    if let local = repository.loadLocal() {      // ① мгновенно с диска
+        state = .loaded(local)
+        syncStatus = .syncing
+    } else {
+        state = .loading
+    }
+    do {
+        let fresh = try await repository.refreshFromNetwork()  // ② фоном обновляем источник правды
+        state = .loaded(fresh)
+        syncStatus = .synced(at: repository.lastSyncedAt ?? Date())
+    } catch {
+        if case .loaded = state { syncStatus = .offline }      // ③ копия есть → просто «офлайн»
+        else { state = .failed(error) }                        // ошибка только при первом запуске без сети
+    }
+}
+```
+Отличия от «было»:
+- билет берётся **с диска первым** — экран наполняется ещё до сети;
+- сеть только **обновляет** копию, а не является единственным источником;
+- появился `TicketSyncStatus` (`synced` / `syncing` / `offline`) — пользователь честно видит актуальность;
+- экран ошибки теперь только при первом запуске без сети.
+
+**Одной строкой:** было — билет = «то, что вернула сеть» (в памяти, в лучшем случае подстрахован кэшем); стало — билет = «то, что лежит на диске в `Application Support`», а сеть лишь держит копию свежей.
+
+### Почему это «источник правды»
+QR строится из **локально сохранённого** `qrPayload`, а не из живого ответа сервера — поэтому посадку можно пройти полностью офлайн. Сеть нужна лишь чтобы держать локальную копию свежей.
+
+### Одна фраза для слайда
+> «Кэш отвечает на вопрос "что показать, если сеть упала". Источник правды отвечает иначе: "данные всегда здесь, локально; сеть — лишь механизм их обновления". Для билета, баланса, черновиков — только второй подход; и лежать они должны в `Application Support`, а не в `Caches`.»
+
+### Мостик к блоку 3
+Выбор папки песочницы — это не только надёжность, но и безопасность: что попадает в бэкап, а что нет. Эта тема продолжается в блоке 3.2 (карта хранилищ) и далее — секреты уезжают уже не в файлы, а в Keychain.
