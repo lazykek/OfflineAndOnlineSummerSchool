@@ -577,3 +577,95 @@ QR строится из **локально сохранённого** `qrPayloa
 
 ### Мостик к блоку 3
 Выбор папки песочницы — это не только надёжность, но и безопасность: что попадает в бэкап, а что нет. Эта тема продолжается в блоке 3.2 (карта хранилищ) и далее — секреты уезжают уже не в файлы, а в Keychain.
+
+---
+
+## Приложение D. Outbox-очередь (углублённо к блоку 2.3)
+
+**Основная идея коммита 5 — offline для ЗАПИСИ.** Коммиты 2–4 решали offline для чтения (кэш, локальный билет). Теперь действие пользователя, сделанное без сети, **не теряется** и автоматически отправляется при восстановлении связи.
+
+Раньше «действие» = немедленный сетевой запрос (без сети — провал). Теперь действие сначала пишется в локальную очередь (outbox), UI реагирует оптимистично, а доставкой занимается фоновый воркер, ждущий сеть.
+
+### Из чего собрано
+- **`NetworkMonitor`** — обёртка над `NWPathMonitor` с `@Published isOnline`. Знание о сети **заранее**: ОС сообщает о появлении/пропаже связи до попытки запроса.
+- **`OutboxItem`** — `Codable`-элемент: `clientID: UUID` (генерируется один раз), `action`, `createdAt`, `status` (`pending`/`inFlight`/`failed`), `retryCount`.
+- **`OutboxStore`** — персистентная очередь поверх `LocalStore` (`outbox.json` в `Application Support`); в `init` читается с диска → **переживает перезапуск**.
+- **`OutboxProcessor`** — воркер, отправляющий `pending`.
+
+### Знание о сети заранее (NWPathMonitor)
+```swift
+@MainActor
+final class NetworkMonitor: ObservableObject {
+    static let shared = NetworkMonitor()
+    @Published private(set) var isOnline: Bool = true
+
+    private let monitor = NWPathMonitor()
+    private init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            let online = path.status == .satisfied
+            Task { @MainActor in self?.isOnline = online }
+        }
+        monitor.start(queue: DispatchQueue(label: "app.networkMonitor"))
+    }
+}
+```
+
+### Воркер: три триггера + backoff
+```swift
+func start() {
+    // ① сеть восстановилась → синхронизируем (суть коммита)
+    monitor.$isOnline.filter { $0 }
+        .sink { [weak self] _ in Task { await self?.processQueue() } }
+        .store(in: &cancellables)
+    // ② старт приложения
+    if monitor.isOnline { Task { await processQueue() } }
+}
+
+func enqueue(_ action: OutboxAction) {
+    outbox.enqueue(action)
+    if monitor.isOnline { Task { await processQueue() } }  // ③ сразу, если онлайн
+}
+
+private func send(_ item: OutboxItem) async {
+    // экспоненциальный backoff между ретраями: 1, 2, 4, 8… c
+    if item.retryCount > 0 {
+        let delay = pow(2.0, Double(item.retryCount - 1))
+        if Date().timeIntervalSince(item.createdAt) < delay { return }
+    }
+    outbox.markInFlight(item.clientID)
+    do {
+        let _: PostResponse = try await api.post(
+            .posts, body: payload,
+            idempotencyKey: item.clientID.uuidString   // 🔑 идемпотентность
+        )
+        outbox.markSent(item.clientID)                 // успех → удаляем
+    } catch {
+        outbox.markFailed(item.clientID)               // retry++/после N → .failed
+    }
+}
+```
+
+### Поток жизни действия
+```
+тап «лайк» (даже офлайн)
+  → enqueue → запись на диск (pending), UI оптимистично
+  → онлайн? нет → ждём NetworkMonitor
+  → сеть появилась → processQueue
+        pending → inFlight → POST(Idempotency-Key) → markSent (удалён)
+        ошибка → markFailed (retry/backoff) → снова pending
+```
+
+### Идемпотентность — зачем `clientID`
+🔑 `clientID` (UUID) **не меняется** между ретраями и летит в заголовке `Idempotency-Key`. Если ответ потерялся после того, как сервер уже применил операцию, повтор с тем же ключом не создаст дубликат.
+> ⚠️ Честная оговорка: в демо сервер (JSONPlaceholder) ключ **не** дедуплицирует и лайки не хранит — это симуляция. Реализована «клиентская половина контракта»; серверную дедупликацию обеспечивает бэкенд.
+
+### Очистка при логауте
+`OutboxStore.clearAll()` вызывается из `SessionStore.logout()` рядом с очисткой кэша и билета — неотправленные действия принадлежат конкретному пользователю и не должны «уехать» от имени другого.
+
+### Сценарий демо
+1. Airplane Mode → тап «лайк» → в Настройках «в очереди: 1».
+2. Убить и перезапустить приложение (всё ещё офлайн) → очередь на месте (читается с `outbox.json`).
+3. Выключить Airplane Mode → `NWPathMonitor` ловит переход → воркер сам отправляет → очередь пустеет.
+
+### Одна фраза для слайда
+> «Offline-first — это не только про чтение. Запись тоже не должна теряться: действие пишем локально, помечаем оптимистично, а доставку поручаем воркеру, который ждёт сеть. Идемпотентный ключ гарантирует, что повтор при ретрае не задвоит операцию.»

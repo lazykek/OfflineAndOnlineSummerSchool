@@ -15,11 +15,11 @@ final class TicketRepository: @unchecked Sendable {
     private let store: LocalStore
     private let client: APIClient
 
-    private let ticketKey   = "ticket"
+    private let ticketKey = "ticket"
     private let syncedAtKey = "ticket.lastSyncedAt"
 
     init(store: LocalStore = .shared, client: APIClient = .shared) {
-        self.store  = store
+        self.store = store
         self.client = client
     }
 

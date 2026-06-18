@@ -51,7 +51,6 @@ enum APIError: LocalizedError {
 struct Fetched<Value> {
     let value: Value
     let dataSource: DataSource
-
     var isFromCache: Bool { dataSource != .network }
 }
 
@@ -122,6 +121,26 @@ nonisolated struct APIClient {
             }
             throw APIError.transport(error)
         }
+    }
+
+    @discardableResult
+    func post<Body: Encodable, Response: Decodable>(
+        _ endpoint: Endpoint,
+        body: Body,
+        idempotencyKey: String
+    ) async throws -> Response {
+        var request = URLRequest(url: endpoint.url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        request.httpBody = try JSONEncoder().encode(body)
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            try validate(response)
+            return try decode(data)
+        } catch let e as APIError { throw e }
+        catch { throw APIError.transport(error) }
     }
 
     // MARK: - Helpers

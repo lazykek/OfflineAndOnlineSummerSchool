@@ -30,5 +30,6 @@ final class SessionStore: ObservableObject {
         UserDefaults.standard.removeObject(forKey: userDefaultsKey)
         CacheManager.shared.clearAll()
         TicketRepository.shared.clearLocal()
+        OutboxStore.shared.clearAll()
     }
 }
