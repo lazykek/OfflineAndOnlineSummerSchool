@@ -9,6 +9,7 @@ import Foundation
 @MainActor
 final class FeedViewModel: ObservableObject {
     @Published var state: LoadState<[Post]> = .idle
+    @Published var isOffline = false
 
     private let client: APIClient
 
@@ -23,11 +24,13 @@ final class FeedViewModel: ObservableObject {
         }
 
         do {
-            let posts: [Post] = try await client.get(.posts)
-            state = .loaded(posts)
+            let result: Fetched<[Post]> = try await client.get(.posts)
+            isOffline = result.isFromCache
+            state = .loaded(result.value)
         } catch is CancellationError {
             return
         } catch {
+            isOffline = false
             state = .failed(error)
         }
     }

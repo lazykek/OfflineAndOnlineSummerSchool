@@ -19,8 +19,8 @@ final class BalanceViewModel: ObservableObject {
     func load() async {
         state = .loading
         do {
-            let user: RemoteUser = try await client.get(.user(id: 1))
-            state = .loaded(Balance(user: user))
+            let result: Fetched<RemoteUser> = try await client.get(.user(id: 1))
+            state = .loaded(Balance(user: result.value))
         } catch {
             state = .failed(error)
         }

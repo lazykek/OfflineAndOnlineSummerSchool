@@ -208,3 +208,168 @@
 - [ ] Файлы лежат в правильных папках песочницы; критичное исключено из ненужного бэкапа.
 - [ ] Чувствительные экраны/операции защищены FaceID, токены привязаны к биометрии.
 - [ ] Офлайн-токены оплаты ограничены сроком, лимитом и подписью.
+
+---
+
+## Приложение A. Как работает URLCache (углублённо к блоку 1.1)
+
+`URLCache` — встроенный в Foundation кэш HTTP-ответов, работающий **на уровне `URLSession`**, прозрачно для кода. Вы делаете обычный запрос, а система сама решает: отдать ответ из кэша или сходить в сеть, опираясь на HTTP-заголовки.
+
+### Что хранит
+Единица хранения — пара **запрос → ответ** (`CachedURLResponse`):
+- `URLResponse` (заголовки, статус-код);
+- тело ответа (`Data`);
+- `userInfo` и политику хранения (`storagePolicy`).
+
+Ключ — `URLRequest` (на практике Foundation ключует в основном по URL; вариативность по заголовкам — только через `Vary`, и поддержана слабо). По умолчанию кэшируются ответы на **GET** со статусом 200 (HTTP допускает и другие коды — 203, 301, 410, — но это краевые случаи).
+
+### Два уровня: память и диск
+```swift
+let cache = URLCache(
+    memoryCapacity: 16 * 1024 * 1024,   // 16 MB RAM
+    diskCapacity: 128 * 1024 * 1024,    // 128 MB disk
+    diskPath: "api-cache"
+)
+```
+- **Memory** — быстрый кэш в RAM, живёт пока запущено приложение.
+- **Disk** — переживает перезапуск; лежит в `Library/Caches` (ОС вправе вычистить под нехватку места — поэтому критичные данные туда нельзя).
+- При превышении ёмкости старые записи вытесняются автоматически.
+
+Подключение к сессии:
+```swift
+let config = URLSessionConfiguration.default
+config.urlCache = cache
+config.requestCachePolicy = .useProtocolCachePolicy
+```
+
+### Главное: кэшем управляет сервер через заголовки
+`URLCache` следует HTTP-семантике, а не угадывает сам. Ключевая мысль: **не клиент решает, кэшировать или нет — это диктует сервер заголовками ответа, а клиент их исполняет.**
+
+При наличии сохранённого ответа система задаёт два последовательных вопроса, за которые отвечают два разных механизма HTTP — **свежесть (freshness)** и **валидация (validation)**:
+1. **«Ответ ещё свежий?»** Если да — отдаём из кэша мгновенно, в сеть не идём вообще (ноль трафика, ноль задержки).
+2. **«Если уже не свежий (stale) — можно ли по-дешёвому перепроверить?»** Если да — делаем **условный запрос**: сервер либо отвечает «не менялось» коротким ответом без тела, либо присылает новую версию.
+
+#### Заголовки свежести — «сколько можно не ходить в сеть»
+Сервер кладёт их в **ответ**:
+- **`Cache-Control: max-age=3600`** — основной механизм: ответ свежий 3600 секунд с момента получения. В это окно `URLSession` отдаёт его из кэша без сети.
+- **`Cache-Control: no-store`** — «не сохранять вообще» (ни память, ни диск). Для чувствительных данных — балансы, персональные данные.
+- **`Cache-Control: no-cache`** — обманчивое имя: это **не** «не кэшировать». Это «сохрани, но **никогда не отдавай без перепроверки** на сервере» (всегда условный запрос).
+- **`Cache-Control: private` / `public`** — кэшировать только на клиенте / можно где угодно (включая прокси и CDN).
+- **`Expires: <дата>`** — устаревший абсолютный аналог `max-age`; если есть оба, `max-age` побеждает.
+
+#### Заголовки валидации — «как дёшево перепроверить устаревшее»
+Когда свежесть истекла, выбрасывать кэш необязательно — сначала спрашиваем сервер «моя версия ещё актуальна?». Работают **парами** (сервер прислал в ответе → клиент шлёт в следующем запросе):
+- **`ETag: "abc123"`** (ответ) ↔ **`If-None-Match: "abc123"`** (запрос) — «отпечаток»/версия ресурса. Точный механизм: реагирует на любое изменение байт.
+- **`Last-Modified: <дата>`** (ответ) ↔ **`If-Modified-Since: <дата>`** (запрос) — то же по дате (разрешение 1 секунда, проще, но грубее).
+
+Ответ сервера на условный запрос:
+- **`304 Not Modified`** — «не менялось, бери из кэша». Тело не передаётся; `URLSession` сам достаёт тело из кэша и отдаёт тебе как обычный успех — в коде ты даже не видишь, что был 304.
+- **`200 OK`** с новым телом и новым `ETag`/`Last-Modified` — ресурс изменился, вот свежая версия.
+
+> `If-None-Match` / `If-Modified-Since` клиент подставляет **автоматически** при `.useProtocolCachePolicy` — вручную их формировать не нужно.
+
+#### Откуда это: стандарт HTTP (а не «фича Apple»)
+Кэширование и `ETag` — **не отдельный протокол и не изобретение Apple**, а часть HTTP. `URLSession` просто реализует общий стандарт; так же это работает в браузере, `curl`, OkHttp и любом HTTP-клиенте. `ETag` — это строка-«отпечаток» версии ресурса, которую сервер вычисляет по своим правилам (хэш тела, версия в БД, timestamp); стандарт описывает не *как* её считать, а **протокол обмена**: сервер прислал `ETag` → клиент запомнил → шлёт `If-None-Match` → сервер отвечает `304` или `200`.
+
+Актуальные стандарты — **RFC 9110 «HTTP Semantics»** и **RFC 9111 «HTTP Caching»** (оба 2022; пришли на смену RFC 2616 и RFC 7230–7235).
+
+| Что | Где описано |
+|---|---|
+| Заголовок `ETag` | RFC 9110, §8.8.3 |
+| `Last-Modified` | RFC 9110, §8.8.2 |
+| Условные запросы (общая глава) | RFC 9110, §13 |
+| `If-None-Match` | RFC 9110, §13.1.2 |
+| `If-Modified-Since` | RFC 9110, §13.1.3 |
+| Статус `304 Not Modified` | RFC 9110, §15.4.5 |
+| Кэширование, свежесть, `Cache-Control` | RFC 9111 (целиком) |
+
+Почитать: [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110) · [RFC 9111](https://www.rfc-editor.org/rfc/rfc9111) · MDN: [ETag](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/ETag), [Conditional requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Conditional_requests), [HTTP caching](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching) · Apple: [URLCache](https://developer.apple.com/documentation/foundation/urlcache).
+
+#### Дерево решений URLCache (при `.useProtocolCachePolicy`)
+```
+Есть ли в кэше ответ на этот запрос?
+├─ Нет → идём в сеть, сохраняем (если заголовки разрешают)
+└─ Да → Он ещё свежий (по max-age / Expires)?
+        ├─ Да → отдаём из кэша, в сеть НЕ идём ✅ (быстро, без трафика)
+        └─ Нет (stale) → Есть ETag / Last-Modified?
+                ├─ Да → условный запрос (If-None-Match / If-Modified-Since)
+                │       ├─ 304 → отдаём тело из кэша (трафик ~0) ✅
+                │       └─ 200 → берём новый ответ, обновляем кэш
+                └─ Нет → идём в сеть за полным ответом
+```
+
+#### Конкретный пример (наш API)
+`jsonplaceholder.typicode.com` на GET `/posts` отвечает с `Cache-Control: max-age=43200` и `ETag`:
+1. **Первый запрос** — сеть, сохраняем JSON + `ETag` + пометку «свежо 43200 сек».
+2. **Через 5 минут** — ответ свежий → мгновенно из кэша, сети нет.
+3. **Через 13 часов** — свежесть истекла → `URLSession` сам шлёт `If-None-Match` → сервер отвечает `304` → отдаётся тело из кэша.
+4. **Нет сети совсем** — `session.data` бросит ошибку (stale + проверить нельзя), и срабатывает наш ручной offline-фолбэк (см. ниже).
+
+Срок жизни в `URLCache` определяет **сервер**. Это отличие от нашего собственного TTL в `CacheManager` (блок 1.3), который не зависит от заголовков.
+
+### Политики (`requestCachePolicy`)
+- **`.useProtocolCachePolicy`** (дефолт, наш выбор) — строго по заголовкам.
+- **`.reloadIgnoringLocalCacheData`** — всегда сеть, кэш игнорировать (так у нас сделаны картинки в `ImageLoader`).
+- **`.returnCacheDataElseLoad`** — сначала кэш, сеть если пусто.
+- **`.returnCacheDataDontLoad`** — только кэш, в сеть не ходить (явный offline-режим).
+
+### Как используется в проекте
+```swift
+do {
+    let (rawData, response) = try await session.data(for: request)   // online: сеть + автокэш
+    try validate(response)
+    cacheManager.saveTimestamp(for: endpoint.cacheKey)
+    return Fetched(value: try decode(rawData), dataSource: .network)
+} catch {
+    if let cached = cache.cachedResponse(for: request),             // offline: ручной фолбэк
+       let value = try? decode(cached.data) as T {
+        let source = cacheManager.dataSource(for: endpoint.cacheKey, isNetworkAvailable: false)
+        return Fetched(value: value, dataSource: source)
+    }
+    throw APIError.transport(error)
+}
+```
+При `.useProtocolCachePolicy` система сама отдаст свежий кэш. Но если сети нет совсем — `session.data` бросает ошибку, и мы вручную достаём последний ответ через `cachedResponse(for:)`. Это offline-фолбэк: показать сохранённое, даже если по HTTP оно протухло. Источник данных фиксируется в `Fetched.dataSource` (`.network` / `.staleCache` / `.offlineCache`), а `isFromCache` — производное от него.
+
+### Полезные операции
+- `cache.cachedResponse(for:)` — достать вручную;
+- `cache.storeCachedResponse(_:for:)` — положить вручную;
+- `cache.removeCachedResponse(for:)` / `removeAllCachedResponses()` — инвалидация (второе вызываем в `CacheManager.clearAll()` при логауте).
+
+### Ключевой код: свой дисковый кэш картинок (обход редиректа)
+Вместо `URLCache` для картинок — явный файловый кэш с детерминированным ключом `SHA256(исходный URL)`, поэтому редирект на CDN не ломает попадание. Трёхуровневая схема: память → диск → сеть.
+```swift
+final class ImageLoader {
+    private let memory = NSCache<NSURL, UIImage>()   // L1: RAM, авто-эвикция
+    let diskCacheURL: URL                            // L2: Library/Caches/image-disk-cache
+
+    func image(for url: URL) async throws -> UIImage {
+        if let cached = memory.object(forKey: url as NSURL) { return cached }   // L1
+        if let image = loadFromDisk(for: url) {                                 // L2
+            memory.setObject(image, forKey: url as NSURL)
+            return image
+        }
+        let (data, _) = try await session.data(from: url)                       // L3
+        guard let image = UIImage(data: data) else { throw URLError(.cannotDecodeContentData) }
+        saveToDisk(data, for: url)
+        memory.setObject(image, forKey: url as NSURL)
+        return image
+    }
+
+    // ключ файла = SHA256(absoluteString) — не зависит от 3xx-редиректа
+    private func diskFileURL(for url: URL) -> URL {
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return diskCacheURL.appendingPathComponent(hex)
+    }
+}
+```
+
+### Подводные камни (для слайда)
+1. **Редиректы (3xx):** ответ сохраняется под финальным URL после редиректа; поиск по исходному URL даёт промах. Из-за этого для картинок (`picsum.photos` отдаёт 302) используется свой дисковый кэш с ключом по исходному URL.
+2. **Только GET и корректные заголовки:** при `no-store` или отсутствии `Cache-Control`/`ETag` кэш может не работать как ожидается.
+3. **`Library/Caches` нестабилен:** ОС удаляет под давлением диска — не для критичных данных (билет → отдельное хранилище, блок 2.1).
+4. **POST не кэшируется** по умолчанию — для offline-записи нужен outbox (блок 2.3).
+
+### Резюме
+`URLCache` — «бесплатный» HTTP-кэш на уровне сессии: подключаете `urlCache`, и `URLSession` кэширует GET-ответы по заголовкам сервера. Поведением управляете через `requestCachePolicy`, а в offline вручную достаёте сохранённый ответ. Минусы — зависимость от заголовков, нюанс с редиректами и нестабильность дискового хранилища, поэтому для серьёзного offline дальше вводятся свой TTL, отдельный источник правды и outbox.

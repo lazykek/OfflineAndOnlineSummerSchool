@@ -22,15 +22,15 @@ struct FeedView: View {
         case .idle, .loading:
             LoadingView()
         case .loaded(let posts):
-            List(posts) { post in
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(post.title)
-                        .font(.headline)
-                    Text(post.body)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+            List {
+                if viewModel.isOffline {
+                    OfflineBadge()
+                        .listRowInsets(EdgeInsets())
+                        .listRowSeparator(.hidden)
                 }
-                .padding(.vertical, 4)
+                ForEach(posts) { post in
+                    postRow(post)
+                }
             }
             .listStyle(.plain)
             .refreshable { await viewModel.load() }
@@ -39,5 +39,23 @@ struct FeedView: View {
                 Task { await viewModel.load() }
             }
         }
+    }
+
+    private func postRow(_ post: Post) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            CachedAsyncImage(url: post.imageURL)
+                .frame(width: 100, height: 60)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(post.title)
+                    .font(.headline)
+                Text(post.body)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.vertical, 4)
     }
 }

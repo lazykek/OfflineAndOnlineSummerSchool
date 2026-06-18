@@ -19,8 +19,8 @@ final class TicketViewModel: ObservableObject {
     func load() async {
         state = .loading
         do {
-            let user: RemoteUser = try await client.get(.user(id: 1))
-            state = .loaded(Ticket(user: user))
+            let result: Fetched<RemoteUser> = try await client.get(.user(id: 1))
+            state = .loaded(Ticket(user: result.value))
         } catch {
             state = .failed(error)
         }
