@@ -5,6 +5,14 @@
 
 import Foundation
 
+// MARK: - TokenHolder
+
+final class TokenHolder: @unchecked Sendable {
+    static let shared = TokenHolder()
+    nonisolated(unsafe) var token: String? = nil
+    private init() {}
+}
+
 // MARK: - Endpoints
 
 enum Endpoint {
@@ -83,7 +91,7 @@ nonisolated struct APIClient {
     // MARK: - Public API
 
     func getCachedIfAvailable<T: Decodable>(_ endpoint: Endpoint) -> Fetched<T>? {
-        let request = URLRequest(url: endpoint.url)
+        let request = authorizedRequest(for: endpoint.url)
         guard
             let cached = cache.cachedResponse(for: request),
             let value = try? decode(cached.data) as T
@@ -97,7 +105,7 @@ nonisolated struct APIClient {
     }
 
     func get<T: Decodable>(_ endpoint: Endpoint) async throws -> Fetched<T> {
-        let request = URLRequest(url: endpoint.url)
+        let request = authorizedRequest(for: endpoint.url)
 
         do {
             let (rawData, response) = try await session.data(for: request)
@@ -129,7 +137,7 @@ nonisolated struct APIClient {
         body: Body,
         idempotencyKey: String
     ) async throws -> Response {
-        var request = URLRequest(url: endpoint.url)
+        var request = authorizedRequest(for: endpoint.url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
@@ -144,6 +152,14 @@ nonisolated struct APIClient {
     }
 
     // MARK: - Helpers
+
+    private func authorizedRequest(for url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        if let token = TokenHolder.shared.token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return request
+    }
 
     private func validate(_ response: URLResponse) throws {
         guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }

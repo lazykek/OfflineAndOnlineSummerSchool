@@ -669,3 +669,97 @@ private func send(_ item: OutboxItem) async {
 
 ### Одна фраза для слайда
 > «Offline-first — это не только про чтение. Запись тоже не должна теряться: действие пишем локально, помечаем оптимистично, а доставку поручаем воркеру, который ждёт сеть. Идемпотентный ключ гарантирует, что повтор при ретрае не задвоит операцию.»
+
+---
+
+## Приложение E. Keychain vs UserDefaults (углублённо к блоку 3.2)
+
+**Основная идея коммита 6 — у пользователя появляется секрет (access token), и решается вопрос «где хранить секреты».** Коммит построен на наглядном контрасте: где **нельзя** (`UserDefaults` — plain-text plist) и где **нужно** (`Keychain` — AES-256 + Secure Enclave). Это начало блока безопасности.
+
+### KeychainStore — обёртка над Security framework
+```swift
+final class KeychainStore: @unchecked Sendable {
+    static let shared = KeychainStore()
+    private let service: String
+
+    func save(_ data: Data, account: String) throws {
+        // сначала пробуем обновить, иначе — добавить
+        let attributes: [CFString: Any] = [
+            kSecValueData: data,
+            // 🔑 класс доступности — ключевая деталь (см. ниже)
+            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        let update = SecItemUpdate(baseQuery(account: account) as CFDictionary,
+                                   attributes as CFDictionary)
+        if update == errSecItemNotFound {
+            var add = baseQuery(account: account)
+            add[kSecValueData] = data
+            add[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            let status = SecItemAdd(add as CFDictionary, nil)
+            guard status == errSecSuccess else { throw KeychainError.unexpectedStatus(status) }
+        }
+    }
+
+    private func baseQuery(account: String) -> [CFString: Any] {
+        [kSecClass: kSecClassGenericPassword,   // стандартный класс для app-токенов
+         kSecAttrService: service,
+         kSecAttrAccount: account]
+    }
+}
+```
+Плюс `read` (`SecItemCopyMatching`) и `delete` (`SecItemDelete`), ошибки — через `enum KeychainError`.
+
+### Класс доступности: `AfterFirstUnlockThisDeviceOnly`
+- **`AfterFirstUnlock`** — токен доступен в фоне после первой разблокировки устройства. Нужно, чтобы фоновый outbox мог слать запросы с `Authorization` без участия пользователя.
+- **`ThisDeviceOnly`** — секрет **не уезжает в iCloud-бэкап** и не переносится на другое устройство. Компрометация бэкапа ≠ компрометация токена.
+
+### Жизненный цикл токена в SessionStore
+```swift
+func login(as name: String) {
+    let token = "demo-token-\(UUID().uuidString)"
+    try? keychain.save(token, account: tokenKeychainAccount)  // ← в Keychain, НЕ в UserDefaults
+    currentUser = name
+    accessToken = token
+    UserDefaults.standard.set(name, forKey: userDefaultsKey)  // имя — не секрет, можно в UD
+    TokenHolder.shared.token = token                          // прокидываем в APIClient
+}
+
+private init() {
+    currentUser = UserDefaults.standard.string(forKey: userDefaultsKey)
+    accessToken = try? keychain.readString(account: tokenKeychainAccount)  // восстановление сессии
+    TokenHolder.shared.token = accessToken
+}
+
+func logout() {
+    try? keychain.delete(account: tokenKeychainAccount)  // ← удаляем секрет первым
+    // … затем CacheManager.clearAll() / clearLocal() / Outbox.clearAll()
+}
+```
+`APIClient` берёт токен из `TokenHolder` и добавляет `Authorization: Bearer <token>` к каждому запросу. `TokenHolder` — мостик между `@MainActor SessionStore` и `nonisolated APIClient`.
+
+🔑 Тонкая деталь контраста прямо в коде: **имя пользователя намеренно лежит в `UserDefaults`** (это не секрет — так правильно), а **токен — только в Keychain**.
+
+### Антипример в Настройках (DEMO ONLY)
+Соседние секции на экране демонстрируют разницу вживую:
+- **🔒 Keychain** — токен зелёным, «Keychain · AES-256», класс доступности, Authorization-заголовок.
+- **⚠️ UserDefaults** — кнопка пишет `INSECURE-<uuid>` в `UserDefaults`, тут же читает его обратно **без всякой защиты** (красным) и показывает путь к `Library/Preferences/<bundle>.plist` — этот файл открывается текстовым редактором, токен виден глазами.
+
+### Контраст одной таблицей
+| | UserDefaults | Keychain |
+|---|---|---|
+| Физически | plain-text `.plist` в `Library/Preferences` | зашифрованная БД ОС |
+| Шифрование | нет | AES-256, ключи в Secure Enclave |
+| Бэкап | уезжает в iCloud как есть | с `ThisDeviceOnly` — не уезжает |
+| Доступ | любой с доступом к файлу/бэкапу | только Security API при разблокировке |
+| Что класть | настройки, флаги, имя пользователя | **секреты: токены, пароли, ключи** |
+
+### Сценарий демо
+1. Войти → секция Keychain показывает токен; перезапустить приложение → токен на месте (восстановлен из Keychain, не из plist).
+2. Нажать «Записать токен в UserDefaults» → токен виден красным + путь к plist → открыть файл, секрет читается глазами.
+3. Выйти → токен из Keychain удалён.
+
+### Мостик к коммиту 7
+Сейчас токен читается **без биометрии** (он нужен фоновому outbox). В коммите 7 добавится второй, **платёжный** токен, привязанный к Keychain через `SecAccessControl(.biometryCurrentSet)` — его чтение потребует FaceID. То есть коммит 6 = «правильное хранилище для секрета», коммит 7 = «биометрический гейт поверх него».
+
+### Одна фраза для слайда
+> «`UserDefaults` — это открытый текст. Положить туда токен = отдать его любому, кто получил доступ к бэкапу или файловой системе. Секреты — только в Keychain, с классом доступности, который не пускает их в чужой бэкап.»

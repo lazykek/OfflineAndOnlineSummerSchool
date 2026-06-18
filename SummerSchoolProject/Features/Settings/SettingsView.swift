@@ -45,7 +45,7 @@ struct SettingsView: View {
                         Button(role: .destructive) {
                             session.logout()
                         } label: {
-                            Label("Выйти (+ очистить кэш и очередь)", systemImage: "door.left.hand.open")
+                            Label("Выйти (+ очистить кэш, очередь, Keychain)", systemImage: "door.left.hand.open")
                         }
                     } else {
                         Text("Не авторизован").foregroundStyle(.secondary)
@@ -59,6 +59,25 @@ struct SettingsView: View {
                         }
                         .disabled(session.currentUser == name)
                     }
+                }
+
+                Section {
+                    KeychainTokenSection()
+                } header: {
+                    Text("🔒 Безопасность · Keychain")
+                } footer: {
+                    Text("Токен хранится с классом kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly: доступен в фоне после первой разблокировки, но не уезжает в iCloud-бэкап на другое устройство.")
+                        .font(.caption)
+                }
+
+                Section {
+                    UserDefaultsAntipatternSection()
+                } header: {
+                    Text("⚠️ Антипример · UserDefaults (plain plist)")
+                } footer: {
+                    Text("ТОЛЬКО ДЛЯ ДЕМО. В продакшне токен нельзя хранить в UserDefaults — это plain-text plist без шифрования.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
 
                 Section {
@@ -86,12 +105,96 @@ struct SettingsView: View {
     }
 }
 
+// MARK: - KeychainTokenSection
+
+private struct KeychainTokenSection: View {
+    @EnvironmentObject private var session: SessionStore
+
+    var body: some View {
+        if let token = session.accessToken {
+            LabeledContent("Токен (Keychain)") {
+                Text(String(token.prefix(20)) + "…")
+                    .font(.caption).monospaced().foregroundStyle(.green)
+            }
+            LabeledContent("Хранилище") {
+                Text("Keychain · AES-256")
+                    .font(.caption).foregroundStyle(.green)
+            }
+            LabeledContent("Класс доступности") {
+                Text("AfterFirstUnlockThisDeviceOnly")
+                    .font(.caption2).monospaced().foregroundStyle(.secondary)
+            }
+            LabeledContent("Authorization-заголовок") {
+                Text("Bearer \(String(token.prefix(12)))…")
+                    .font(.caption2).monospaced().foregroundStyle(.secondary)
+            }
+        } else {
+            Label("Токен отсутствует — войдите в аккаунт", systemImage: "lock.slash")
+                .foregroundStyle(.secondary).font(.subheadline)
+        }
+    }
+}
+
+// MARK: - UserDefaultsAntipatternSection
+
+private struct UserDefaultsAntipatternSection: View {
+    private let demoUDKey = "DEMO_ONLY.insecureToken"
+    @State private var isExpanded = false
+
+    var body: some View {
+        Button {
+            let fakeToken = "INSECURE-\(UUID().uuidString.prefix(8))"
+            UserDefaults.standard.set(fakeToken, forKey: demoUDKey)
+            isExpanded = true
+        } label: {
+            Label("Записать токен в UserDefaults (антипример)", systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        }
+
+        if isExpanded {
+            let udToken = UserDefaults.standard.string(forKey: demoUDKey)
+
+            LabeledContent("Читается из UserDefaults") {
+                Text(udToken ?? "—")
+                    .font(.caption).monospaced()
+                    .foregroundStyle(.red)
+            }
+
+            LabeledContent("Путь к plain-text plist") {
+                Text(plistFilePath())
+                    .font(.caption2).foregroundStyle(.orange)
+                    .lineLimit(3).multilineTextAlignment(.trailing)
+            }
+
+            Text("☝️ Открой этот файл — токен виден как plain text!\nВ Keychain тот же токен зашифрован AES-256.")
+                .font(.caption).foregroundStyle(.orange).padding(.vertical, 2)
+
+            Button(role: .destructive) {
+                UserDefaults.standard.removeObject(forKey: demoUDKey)
+                isExpanded = false
+            } label: {
+                Label("Удалить антипример из UserDefaults", systemImage: "trash")
+            }
+            .font(.caption)
+        }
+    }
+
+    private func plistFilePath() -> String {
+        let bundle = Bundle.main.bundleIdentifier ?? "app"
+        let libraryDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
+        let filePath = libraryDir?.appendingPathComponent("Preferences/\(bundle).plist").path
+            ?? "Library/Preferences/\(bundle).plist"
+        print(filePath)
+        return filePath
+    }
+}
+
 // MARK: - OutboxStatusSection
 
 private struct OutboxStatusSection: View {
-    @EnvironmentObject private var outbox:    OutboxStore
+    @EnvironmentObject private var outbox: OutboxStore
     @EnvironmentObject private var processor: OutboxProcessor
-    @EnvironmentObject private var monitor:   NetworkMonitor
+    @EnvironmentObject private var monitor: NetworkMonitor
 
     var body: some View {
         HStack {
@@ -175,9 +278,9 @@ private struct CacheInfoRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            infoLine("URLCache (диск)",  "\(CacheManager.shared.urlCache.currentDiskUsage / 1024) KB")
-            infoLine("URLCache (RAM)",   "\(CacheManager.shared.urlCache.currentMemoryUsage / 1024) KB")
-            infoLine("Возраст /posts",   ageString(for: "endpoint.posts"))
+            infoLine("URLCache (диск)", "\(CacheManager.shared.urlCache.currentDiskUsage / 1024) KB")
+            infoLine("URLCache (RAM)", "\(CacheManager.shared.urlCache.currentMemoryUsage / 1024) KB")
+            infoLine("Возраст /posts", ageString(for: "endpoint.posts"))
             infoLine("Возраст /users/1", ageString(for: "endpoint.user.1"))
         }
         .font(.caption)
@@ -190,8 +293,8 @@ private struct CacheInfoRow: View {
 
     private func ageString(for key: String) -> String {
         guard
-            let data   = UserDefaults.standard.data(forKey: "cache.timestamps.v1"),
-            let dict   = try? JSONDecoder().decode([String: Date].self, from: data),
+            let data = UserDefaults.standard.data(forKey: "cache.timestamps.v1"),
+            let dict = try? JSONDecoder().decode([String: Date].self, from: data),
             let savedAt = dict[key]
         else { return "нет данных" }
 
