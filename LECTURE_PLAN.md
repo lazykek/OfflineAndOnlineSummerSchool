@@ -763,3 +763,124 @@ func logout() {
 
 ### Одна фраза для слайда
 > «`UserDefaults` — это открытый текст. Положить туда токен = отдать его любому, кто получил доступ к бэкапу или файловой системе. Секреты — только в Keychain, с классом доступности, который не пускает их в чужой бэкап.»
+
+---
+
+## Приложение F. Биометрия: FaceID-гейт + SecAccessControl (углублённо к блоку 3.4)
+
+**Основная идея коммита 7 — биометрия как ГЕЙТ ДОСТУПА.** Появляются две вещи: (1) FaceID-замок на экране билета и (2) платёжный токен, привязанный к Keychain через `SecAccessControl` — его чтение само запрашивает FaceID на уровне ОС.
+
+🔑 **Ключевой тезис: FaceID — это гейт, а не шифрование.** Данные билета уже лежат на диске (`Application Support`) и защищены iOS Data Protection. Биометрия не расшифровывает их — она лишь решает: **показать пользователю или нет.**
+
+### Что появляется
+- **`BiometricAuth`** — обёртка над `LAContext` с async/await.
+- **FaceID-гейт на `TicketView`** — экран блокировки + реблокировка при уходе в фон.
+- **`KeychainStore.saveBiometricProtected` / `readBiometricProtected`** — секрет, привязанный к биометрии.
+- **Второй секрет `paymentToken`** в `SessionStore` — защищён биометрией (в отличие от `accessToken`).
+
+### BiometricAuth: две политики
+```swift
+// только биометрия — для ГЕЙТА на билет
+func authenticate(reason: String) async -> Result<Void, BiometricError> {
+    let ctx = LAContext()
+    ctx.localizedFallbackTitle = ""   // убираем кнопку «ввести пароль»
+    guard ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: ...) else { ... }
+    // evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, …)
+}
+
+// биометрия ИЛИ пароль устройства — фолбэк при notEnrolled (напр. симулятор без FaceID)
+func authenticateWithFallback(reason: String) async -> Result<Void, BiometricError> {
+    // evaluatePolicy(.deviceOwnerAuthentication, …)
+}
+```
+- `.deviceOwnerAuthenticationWithBiometrics` — **только** FaceID/TouchID, без автофолбэка на пароль.
+- `.deviceOwnerAuthentication` — биометрия **или** пароль устройства.
+- `BiometryType` (faceID/touchID/none) и `BiometricError` (unavailable/notEnrolled/canceled/failed/lockout) — для корректных текстов и иконок в UI.
+
+### FaceID-гейт билета (реблокировка при фоне)
+```swift
+struct TicketView: View {
+    @State private var isUnlocked = false
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some View {
+        Group {
+            if isUnlocked { unlockedContent } else { biometricGateView }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background { isUnlocked = false }   // ← гейт, не «один раз навсегда»
+        }
+    }
+
+    private func authenticate() async {
+        switch await biometric.authenticate(reason: "Подтвердите личность…") {
+        case .success:
+            isUnlocked = true
+            await viewModel.load()
+        case .failure(.notEnrolled):
+            // фолбэк на пароль, чтобы симулятор без биометрии не был заблокирован
+            if case .success = await biometric.authenticateWithFallback(reason: …) { isUnlocked = true }
+        case .failure(.canceled): break
+        case .failure(let e): authError = e.errorDescription
+        }
+    }
+}
+```
+На экране блокировки есть честная подпись: «FaceID не шифрует билет — данные лежат в Application Support. Биометрия решает лишь: показать их или нет».
+
+### Привязка Keychain к биометрии: SecAccessControl
+```swift
+func saveBiometricProtected(_ string: String, account: String) throws {
+    // ACL: текущий набор биометрии; при добавлении нового лица секрет станет недоступен
+    let access = SecAccessControlCreateWithFlags(
+        kCFAllocatorDefault,
+        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        .biometryCurrentSet,                 // 🔑 не .biometryAny
+        &error
+    )
+    let query: [CFString: Any] = [
+        kSecClass: kSecClassGenericPassword,
+        kSecAttrService: service,
+        kSecAttrAccount: account,
+        kSecValueData: data,
+        kSecAttrAccessControl: access        // ← привязка к ACL
+    ]
+    SecItemAdd(query as CFDictionary, nil)
+}
+
+func readBiometricProtected(account: String, prompt: String) throws -> String? {
+    let ctx = LAContext()
+    ctx.localizedReason = prompt
+    var query = baseQuery(account: account)
+    query[kSecReturnData] = true
+    query[kSecUseAuthenticationContext] = ctx   // iOS сама покажет FaceID-промпт
+    // SecItemCopyMatching → Secure Enclave проверяет биометрию → отдаёт данные
+}
+```
+🔑 Принципиально: при чтении приложение **не вызывает** `LAContext.evaluatePolicy` вручную — биометрию запрашивает **сам Keychain** через Secure Enclave. Это сильнее, чем «гейт в UI»: секрет физически не отдаётся без биометрии.
+
+**`.biometryCurrentSet` vs `.biometryAny`:**
+- `.biometryAny` — добавили новое лицо/отпечаток → секрет **всё ещё** читается (риск).
+- `.biometryCurrentSet` — добавили новое лицо → секрет **недоступен** (защита от подмены биометрии). Правильный выбор для платёжных токенов.
+
+### Два токена одного Keychain
+| Токен | Класс/ACL | Чтение |
+|---|---|---|
+| `accessToken` (коммит 6) | `AfterFirstUnlockThisDeviceOnly` | без биометрии (нужен фоновому outbox) |
+| `paymentToken` (коммит 7) | `SecAccessControl(.biometryCurrentSet)` | **только через FaceID** на уровне ОС |
+
+`SessionStore.login` сохраняет оба; `logout` удаляет оба (единая точка — все 5 слоёв: Keychain×2 + Cache + LocalStore + Outbox).
+
+### Не забыть: Info.plist
+Нужен ключ `NSFaceIDUsageDescription` — без него обращение к FaceID **крашит** приложение.
+
+### Сценарий демо (симулятор)
+1. Войти → `Features → Face ID → Enrolled`.
+2. Вкладка «Билет» → экран блокировки → «Разблокировать» → `Features → Face ID → Matching Face` → билет с QR.
+3. Свернуть и вернуть приложение → билет снова заблокирован (реблокировка при фоне).
+4. `Non-matching Face` → ошибка + повтор.
+5. В Настройках «показать платёжный токен» → системный FaceID-промпт (Keychain-level, без `evaluatePolicy` в коде).
+6. Выключить Enrolled → фолбэк на пароль устройства. Выйти → оба секрета удалены.
+
+### Одна фраза для слайда
+> «FaceID — это замок на двери, а не сейф. Данные уже зашифрованы на диске; биометрия только решает, открыть ли их показ. А `SecAccessControl(.biometryCurrentSet)` встраивает биометрию в саму запись Keychain — секрет не отдаётся ОС без живого FaceID, и становится недоступен, если набор биометрии изменили.»

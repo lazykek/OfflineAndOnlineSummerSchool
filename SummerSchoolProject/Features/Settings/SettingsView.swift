@@ -71,6 +71,15 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    BiometricPaymentTokenSection()
+                } header: {
+                    Text("🔑 Биометрия · Keychain + SecAccessControl")
+                } footer: {
+                    Text("Платёжный токен защищён .biometryCurrentSet: iOS сама запрашивает FaceID при чтении из Keychain. Добавление нового лица/отпечатка делает секрет недоступным.")
+                        .font(.caption)
+                }
+
+                Section {
                     UserDefaultsAntipatternSection()
                 } header: {
                     Text("⚠️ Антипример · UserDefaults (plain plist)")
@@ -132,6 +141,97 @@ private struct KeychainTokenSection: View {
             Label("Токен отсутствует — войдите в аккаунт", systemImage: "lock.slash")
                 .foregroundStyle(.secondary).font(.subheadline)
         }
+    }
+}
+
+// MARK: - BiometricPaymentTokenSection
+
+private struct BiometricPaymentTokenSection: View {
+    @EnvironmentObject private var session: SessionStore
+
+    @State private var revealedToken: String? = nil
+    @State private var isReading = false
+    @State private var readError: String? = nil
+
+    private let keychain = KeychainStore.shared
+    private let biometric = BiometricAuth.shared
+
+    var body: some View {
+        LabeledContent("Биометрия") {
+            HStack(spacing: 4) {
+                Image(systemName: biometric.biometryType.systemImage)
+                Text(biometric.biometryType.displayName)
+            }
+            .font(.caption).foregroundStyle(.blue)
+        }
+
+        LabeledContent("Платёжный токен") {
+            if let token = revealedToken {
+                Text(String(token.prefix(20)) + "…")
+                    .font(.caption).monospaced().foregroundStyle(.purple)
+            } else {
+                Text("скрыт").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+
+        LabeledContent("SecAccessControl") {
+            Text(".biometryCurrentSet")
+                .font(.caption2).monospaced().foregroundStyle(.purple)
+        }
+
+        if let error = readError {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                Text(error).font(.caption).foregroundStyle(.orange)
+            }
+        }
+
+        if session.currentUser != nil {
+            Button {
+                Task { await readPaymentToken() }
+            } label: {
+                HStack(spacing: 8) {
+                    if isReading { ProgressView().scaleEffect(0.8) }
+                    else { Image(systemName: biometric.biometryType.systemImage) }
+                    Text("Показать платёжный токен")
+                }
+                .foregroundStyle(.purple)
+            }
+            .disabled(isReading)
+
+            if revealedToken != nil {
+                Button(role: .destructive) { revealedToken = nil } label: {
+                    Label("Скрыть токен", systemImage: "eye.slash")
+                }
+                .font(.caption)
+            }
+        } else {
+            Label("Войдите в аккаунт для демонстрации", systemImage: "person.slash")
+                .foregroundStyle(.secondary).font(.caption)
+        }
+
+        Text("☝️ iOS сама показывает FaceID промпт — без вызова LAContext в коде приложения. Это Keychain-level биометрия через Secure Enclave.")
+            .font(.caption2).foregroundStyle(.secondary)
+    }
+
+    private func readPaymentToken() async {
+        isReading = true
+        readError = nil
+        revealedToken = nil
+
+        do {
+            let token = try keychain.readBiometricProtected(
+                account: session.paymentTokenKeychainAccount,
+                prompt: "Подтвердите личность для просмотра платёжных данных"
+            )
+            revealedToken = token ?? "токен не найден"
+        } catch KeychainError.authFailed {
+            readError = "Биометрия отклонена или отменена"
+        } catch {
+            readError = error.localizedDescription
+        }
+
+        isReading = false
     }
 }
 

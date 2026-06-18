@@ -2,5 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- COMMIT 7: Обязательный ключ для FaceID. Без него приложение крашит при вызове LAContext. -->
+	<!-- Текст отображается пользователю в системном диалоге FaceID. -->
+	<key>NSFaceIDUsageDescription</key>
+	<string>Подтвердите личность, чтобы открыть билет и платёжные данные</string>
 </dict>
 </plist>

@@ -5,6 +5,7 @@
 
 import Foundation
 import Security
+import LocalAuthentication
 
 // MARK: - KeychainError
 
@@ -16,9 +17,9 @@ enum KeychainError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-            case .duplicateItem:           return "Keychain: элемент уже существует."
-            case .itemNotFound:            return "Keychain: элемент не найден."
-            case .authFailed:              return "Keychain: ошибка авторизации."
+            case .duplicateItem:  return "Keychain: элемент уже существует."
+            case .itemNotFound: return "Keychain: элемент не найден."
+            case .authFailed: return "Keychain: ошибка авторизации."
             case .unexpectedStatus(let s): return "Keychain: OSStatus \(s)."
         }
     }
@@ -97,6 +98,64 @@ final class KeychainStore: @unchecked Sendable {
     func readString(account: String) throws -> String? {
         guard let data = try read(account: account) else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    // MARK: - Biometric-Protected API
+
+    func saveBiometricProtected(_ string: String, account: String) throws {
+        guard let data = string.data(using: .utf8) else { return }
+
+        var accessError: Unmanaged<CFError>?
+        guard let accessControl = SecAccessControlCreateWithFlags(
+            kCFAllocatorDefault,
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            .biometryCurrentSet,
+            &accessError
+        ) else {
+            throw KeychainError.unexpectedStatus(errSecParam)
+        }
+
+        try? delete(account: account)
+
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecValueData: data,
+            kSecAttrAccessControl: accessControl
+        ]
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        switch status {
+            case errSecSuccess:       return
+            case errSecDuplicateItem: throw KeychainError.duplicateItem
+            default:                  throw KeychainError.unexpectedStatus(status)
+        }
+    }
+
+    func readBiometricProtected(account: String, prompt: String) throws -> String? {
+        let ctx = LAContext()
+        ctx.localizedReason = prompt
+
+        var query: [CFString: Any] = baseQuery(account: account)
+        query[kSecReturnData] = true
+        query[kSecMatchLimit] = kSecMatchLimitOne
+        query[kSecUseAuthenticationContext] = ctx
+
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        switch status {
+            case errSecSuccess:
+                guard let data = result as? Data else { return nil }
+                return String(data: data, encoding: .utf8)
+            case errSecItemNotFound:
+                return nil
+            case errSecAuthFailed, errSecUserCanceled:
+                throw KeychainError.authFailed
+            default:
+                throw KeychainError.unexpectedStatus(status)
+        }
     }
 
     // MARK: - Private

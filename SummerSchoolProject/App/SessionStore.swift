@@ -15,6 +15,8 @@ final class SessionStore: ObservableObject {
 
     private let userDefaultsKey = "session.currentUser"
     private let tokenKeychainAccount = "accessToken"
+    let paymentTokenKeychainAccount = "paymentToken"
+
     private let keychain = KeychainStore.shared
 
     private init() {
@@ -40,6 +42,13 @@ final class SessionStore: ObservableObject {
             print("[SessionStore] ⚠️ Keychain save failed: \(error)")
         }
 
+        let paymentToken = "payment-token-\(UUID().uuidString)"
+        do {
+            try keychain.saveBiometricProtected(paymentToken, account: paymentTokenKeychainAccount)
+        } catch {
+            print("[SessionStore] ⚠️ Biometric Keychain save failed: \(error)")
+        }
+
         currentUser = name
         accessToken = token
         UserDefaults.standard.set(name, forKey: userDefaultsKey)
@@ -50,7 +59,13 @@ final class SessionStore: ObservableObject {
         do {
             try keychain.delete(account: tokenKeychainAccount)
         } catch {
-            print("[SessionStore] ⚠️ Keychain delete failed: \(error)")
+            print("[SessionStore] ⚠️ Keychain delete (accessToken) failed: \(error)")
+        }
+
+        do {
+            try keychain.delete(account: paymentTokenKeychainAccount)
+        } catch {
+            print("[SessionStore] ⚠️ Keychain delete (paymentToken) failed: \(error)")
         }
 
         currentUser = nil
